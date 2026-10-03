@@ -1990,7 +1990,15 @@ static void launch_fattn_new_mma(
         blocks_num.y = 1;
         blocks_num.z = 1;
 
-        dst_tmp_meta.alloc(blocks_num.x*ncols * (2*2 + DV) * sizeof(float));
+        // The kernel addresses dst_tmp_meta as float2: gridDim.x*2*ncols entries of (max, rowsum) followed by
+        // gridDim.x*ncols*(DV/2) entries of partial results, i.e. gridDim.x*ncols*(2 + DV/2) float2 in total, and it
+        // only touches them when a block works on a fractional tile (the same condition that launches the fixup kernel
+        // below). The previous expression computed that size in bytes but passed it as a float2 element count, an 8x
+        // over-allocation; on Ampere the whole-tile path (blocks_num.x == ntiles_total) therefore reserved ~1 MiB of
+        // pool memory per ubatch token (2 GiB at -ub 2048 for DV = 512) that was never written. 2026-10-02.
+        if (ntiles_total % blocks_num.x != 0) {
+            dst_tmp_meta.alloc(blocks_num.x*ncols * (2 + DV/2));
+        }
     } else {
         GGML_ASSERT(K->ne[1] % KQ_row_granularity == 0);
         const int ntiles_KQ = K->ne[1] / KQ_row_granularity; // Max. number of parallel blocks limited by tensor size.
