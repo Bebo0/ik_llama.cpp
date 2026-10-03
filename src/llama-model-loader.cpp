@@ -415,6 +415,43 @@ llama_model_loader::llama_model_loader(const std::string & fname, int ncmoe, boo
         LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
     }
 
+    // model-serving-p620: optional tensor overlay. LLAMA_TENSOR_OVERLAY=<file.gguf> names a GGUF whose tensors replace
+    // the same-named tensors of the model (same shape, any type), e.g. dense tensors requantized Q8_0 -> Q6_0 without
+    // rewriting the 150 GB of routed experts. The overlay's data is read from its own file.
+    if (const char * overlay = getenv("LLAMA_TENSOR_OVERLAY"); overlay != nullptr && overlay[0] != 0) {
+        struct gguf_init_params ov_params = {
+            /*.no_alloc = */ true,
+            /*.ctx      = */ &ctx,
+        };
+        struct gguf_context * ov_gguf = gguf_init_from_file(overlay, ov_params);
+        if (!ov_gguf) {
+            throw std::runtime_error(format("%s: failed to load tensor overlay %s\n", __func__, overlay));
+        }
+        files.emplace_back(new llama_file(overlay, "rb"));
+        contexts.emplace_back(ctx);
+        const uint16_t ov_idx = (uint16_t) (files.size() - 1);
+        int n_replaced = 0;
+        size_t bytes_old = 0, bytes_new = 0;
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            auto it = std::find_if(weights.begin(), weights.end(), [cur](const llama_tensor_weight & w) {
+                return strcmp(w.tensor->name, cur->name) == 0;
+            });
+            if (it == weights.end()) {
+                throw std::runtime_error(format("tensor overlay: '%s' is not a tensor of the model", cur->name));
+            }
+            if (!ggml_are_same_shape(it->tensor, cur)) {
+                throw std::runtime_error(format("tensor overlay: '%s' has a different shape than the model's", cur->name));
+            }
+            bytes_old += ggml_nbytes(it->tensor);
+            bytes_new += ggml_nbytes(cur);
+            *it = llama_tensor_weight(files.back().get(), ov_idx, cur->name, ov_gguf, cur);
+            ++n_replaced;
+        }
+        gguf_free(ov_gguf);
+        LLAMA_LOG_INFO("%s: tensor overlay %s replaced %d tensors (%.2f MiB -> %.2f MiB)\n", __func__, overlay, n_replaced,
+                bytes_old/1048576.0, bytes_new/1048576.0);
+    }
+
     n_kv      = gguf_get_n_kv(meta);
     n_tensors = weights.size();
 

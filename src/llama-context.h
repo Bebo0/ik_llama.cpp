@@ -660,6 +660,22 @@ struct llama_context {
     struct ggml_tensor * inp_kpool_bias      = nullptr; // F32 [n_pool, n_tokens] 0 if pool complete & visible to query, else -inf
     struct ggml_tensor * inp_kpool_tail      = nullptr; // I32 [kpool-1, n_tokens] trailing incomplete pool cells (null when kpool==1)
     struct ggml_tensor * inp_kpool_ape_slots = nullptr; // I32 [kpool] identity [0..kpool-1], gathers the ape rows in order
+    // GLM5NEXT pooled-key cache (kv_self.kp_l): a complete pool's key never changes, so only the
+    // pools this ubatch writes into are pooled again; every other pool key is read back from kp_l
+    struct ggml_tensor * inp_kpool_win_pools = nullptr; // I32 [n_win]       pool index each window entry rebuilds
+    struct ggml_tensor * inp_kpool_win_cells = nullptr; // I32 [kpool*n_win] member cells of those pools
+    // the last built glm5next graph re-pools every pool (stale rebuild); such a graph must not be
+    // reused once the cache is fresh again, or every later step would keep paying the full re-pool
+    bool kpool_full_window_graph = false;
+    // GLM5NEXT decode fast path (n_tokens == 1, one sequence): attention gathers only the selected
+    // K rows instead of running flash attention over all n_kv cells behind a sparse mask
+    struct ggml_tensor * inp_kpool_fast_mbias = nullptr; // F32 [kpool, n_pool] per-member mask bias (pool_bias; -inf on cell 0 when the tail carries it)
+    struct ggml_tensor * inp_kpool_fast_tail  = nullptr; // I32 [n_fast - kpool*n_sel] tail cells, then pad rows (cell 0)
+    struct ggml_tensor * inp_kpool_fast_tbias = nullptr; // F32 [n_fast*mask_rows - kpool*n_sel] tail bias, then -inf (pad rows and padded query rows)
+    // smallest pool index an ubatch wrote into while it lay beyond the graph's n_pool (positions
+    // ahead of cells: holes left by seq_rm, several sequences). kp_l does not hold that pool, so
+    // the first graph whose n_pool reaches it re-pools every pool. INT64_MAX while none.
+    int64_t kpool_skipped_min = INT64_MAX;
 
     // Qwen sparse attention: everything that depends on cache layout is computed on the host,
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
@@ -676,7 +692,9 @@ struct llama_context {
     std::vector<qsa_input> inp_qsa;
 
     // the pooled block keys no longer match the raw indexer keys and the next built graph must
-    // pool every block; set on state restore and defrag, cleared by that graph's host fill
+    // pool every block; set on state restore and defrag, cleared by that graph's host fill.
+    // GLM5NEXT shares it for its k-pool cache (kp_l), which additionally goes stale on a position
+    // shift (seq_add/seq_div) because its pools are keyed by position
     bool qsa_pooled_stale = false;
 
     // token at each position of a sequence, read by the PLE n-gram hash

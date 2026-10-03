@@ -2065,6 +2065,27 @@ bool common_speculative_load_draft_model(
     return true;
 }
 
+// Physical batch for an embedded MTP draft context. The draft context only ever decodes the
+// accepted tokens (1..n_max+1) and the prompt warmup, so it does not need the target's large
+// -ub: its worst-case compute buffer is reserved at n_ubatch tokens, and for glm5next at 128K
+// that buffer (dense KQ/indexer masks and [n_pool, n_head, n_tokens] indexer scores for one
+// layer) would not fit next to the target on a 16 GB card. LLAMA_MTP_UBATCH overrides the
+// default (0 keeps the target's -ub).
+static int32_t common_speculative_mtp_ubatch(const llama_model * model, int32_t n_ubatch_target) {
+    int32_t n_ubatch = 0;
+    const char * arch = model ? llama_model_arch_string(model) : nullptr;
+    if (arch != nullptr && std::strcmp(arch, "glm5next") == 0) {
+        n_ubatch = 32;
+    }
+    if (const char * env = std::getenv("LLAMA_MTP_UBATCH"); env != nullptr && *env != '\0') {
+        n_ubatch = std::max(0, std::atoi(env));
+    }
+    if (n_ubatch <= 0 || n_ubatch >= n_ubatch_target) {
+        return n_ubatch_target;
+    }
+    return n_ubatch;
+}
+
 bool common_speculative_prepare_mtp_runtime(
         common_params_speculative & params,
         const gpt_params         & params_base,
@@ -2102,6 +2123,12 @@ bool common_speculative_prepare_mtp_runtime(
     if (!has_external_mtp) {
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        const int32_t n_ubatch_mtp = common_speculative_mtp_ubatch(model, params_mtp.n_ubatch);
+        if (n_ubatch_mtp != params_mtp.n_ubatch) {
+            LOG_INF("%s: MTP draft context n_ubatch = %d (target %d)\n",
+                    __func__, n_ubatch_mtp, params_mtp.n_ubatch);
+            params_mtp.n_ubatch = n_ubatch_mtp;
+        }
         params.cparams_dft = common_context_params_to_llama(params_mtp);
     }
 
