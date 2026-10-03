@@ -1414,8 +1414,13 @@ static bool llama_kv_cache_init(
     int n_kv_active_layers = 0;
     const int n_mtp_first_layer = hparams.n_layer - hparams.nextn_predict_layers;
     for (int i = 0; i < (int) n_layer; i++) {
+        // glm5next: the NextN block runs only in the MTP draft context, which allocates its own
+        // cache for it; the target context would carry ~192 MiB of never-read latent-KV and
+        // indexer rows for it at 128K, which the 16 GB card cannot spare
+        const bool skip_target_mtp_tail = model.arch == LLM_ARCH_GLM5NEXT &&
+            cparams.mtp_op_type == MTP_OP_NONE && i >= n_mtp_first_layer;
         // For MTP-only context, skip KV allocation for non-MTP layers
-        if (cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) {
+        if ((cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first_layer) || skip_target_mtp_tail) {
             cache.k_l.push_back(nullptr);
             if (!is_dsv4_k_only && model.arch != LLM_ARCH_OPENPANGU &&
                     (!is_mla_attn || !cparams.mla_attn || (cparams.mla_attn == 1 && !cparams.flash_attn))) {
@@ -10698,6 +10703,13 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         llama_pos n_past, int accepted_step) {
     auto & kv = ctx->kv_self;
 
+    // model-serving-p620: a speculative rollback rewinds positions whose draft indexer keys may already be pooled
+    // into kp_l (a verify batch can complete a pool with draft tokens); rebuild every pool on the next graph.
+    // Measured 2026-09-26: MTP + the k-pool cache degenerated after a context-checkpoint restore without this.
+    if (ctx->model.arch == LLM_ARCH_GLM5NEXT && !kv.kp_l.empty()) {
+        ctx->qsa_pooled_stale = true;
+    }
+
     switch (kv.ckpt.selected_spec_mode) {
         case LLAMA_SPEC_CKPT_PER_STEP: {
             if (llm_arch_is_dsv4(ctx->model.arch)) {
@@ -10709,7 +10721,12 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
-            if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
+            // cells[seq_id] is the sequence's state cell only in a pure recurrent cache. In
+            // glm5next's hybrid cache it is an attention cell (the token at position seq_id),
+            // and moving its pos would corrupt the DSA k-pool membership built from cell.pos
+            // (pool 0 would lose a member and be masked for the rest of the sequence).
+            const bool state_cell_is_seq_cell = kv.recurrent || ctx->model.arch != LLM_ARCH_GLM5NEXT;
+            if (state_cell_is_seq_cell && seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
             }
             llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
@@ -10779,6 +10796,10 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    // model-serving-p620: removed cells may belong to pools already in kp_l (draft rollback, prompt truncation)
+    if (result && ctx->model.arch == LLM_ARCH_GLM5NEXT && !ctx->kv_self.kp_l.empty()) {
+        ctx->qsa_pooled_stale = true;
+    }
     if (result && llm_arch_is_dsv4(ctx->model.arch) && p0 <= 0 && p1 < 0) {
         llama_reset_dsv4_state(ctx, seq_id);
     }

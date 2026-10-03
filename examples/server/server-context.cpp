@@ -662,6 +662,18 @@ int server_slot::get_n_draft_max() const {
         return 0;
     }
 
+    // model-serving-p620: LLAMA_SPEC_MAX_CTX=N stops drafting once the slot holds N tokens (the same path as a
+    // draft that no longer fits the context). GLM-5.3-Flash: the DSA decode fast path covers one-token steps only
+    // and the NextN layer re-pools its whole context per call, so MTP wins below ~20K tokens and loses above.
+    static const int spec_max_ctx = [] {
+        const char * env = getenv("LLAMA_SPEC_MAX_CTX");
+        return env ? atoi(env) : 0;
+    }();
+    if (spec_max_ctx > 0 && n_past >= spec_max_ctx) {
+        SLT_DBG(*this, "n_past %d >= LLAMA_SPEC_MAX_CTX %d - skipping speculative decoding\n", n_past, spec_max_ctx);
+        return 0;
+    }
+
     // determine the max draft that fits the current slot state
     int n_draft_max = params.speculative.get_max_stage_n_max();
     const int configured_dflash_n_max = common_speculative_get_configured_n_max(spec);
@@ -1580,6 +1592,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {  // apply logit bias
+        // model-serving-p620: start every request from the server's own bias. Upstream keeps the previous
+        // request's logit_bias on the slot unless the new request sends one, so a single ignore_eos request
+        // (bench-p620 decode) banned EOS for every later request on the slot (2026-09-26, PERF_RESULTS 13.13).
+        slot.sparams.logit_bias = default_sparams.logit_bias;
         const auto& logit_bias = data.find("logit_bias");
         if (logit_bias != data.end() && (logit_bias->is_object() || logit_bias->is_array())) {
             slot.sparams.logit_bias.clear(); // only clear if user sets it

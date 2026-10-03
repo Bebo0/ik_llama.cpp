@@ -5076,7 +5076,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 ggml_type src0_type = op->src[0]->type;
                 if (src0_type == GGML_TYPE_I32) {
                     const int32_t dim = ((const int32_t *) op->op_params)[0];
+                    // model-serving-p620: decode/verify-sized index lists only (<= 64 query tokens). The
+                    // prefill chunk concats stay on the CPU as before: on the GPU they raised the 128K
+                    // reserve by ~600 MiB and the CUDA pool then ran out of memory on a 16 GB card.
                     return op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                           op->ne[1]*op->ne[2]*op->ne[3] <= 64 &&
                            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                            (dim == 0 || dim == 3 || (dim == 2 && op->ne[3] == 1) ||
                             (dim == 1 && op->ne[2]*op->ne[3] == 1));
