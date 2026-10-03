@@ -5067,9 +5067,24 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                     return false;
             }
         }
+        case GGML_OP_CONCAT:
+            {
+                // ggml_cuda_op_concat moves contiguous rows as raw 4-byte words (cudaMemcpyAsync for
+                // dim >= 1, concat_f32_dim0 for dim 0), which is exact for I32 too. Index lists such
+                // as the GLM5NEXT DSA top-k + tail cells then stay on the GPU instead of a
+                // GPU -> CPU -> GPU round trip (and a scheduler split) per indexer layer and step.
+                ggml_type src0_type = op->src[0]->type;
+                if (src0_type == GGML_TYPE_I32) {
+                    const int32_t dim = ((const int32_t *) op->op_params)[0];
+                    return op->src[1]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_I32 &&
+                           ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                           (dim == 0 || dim == 3 || (dim == 2 && op->ne[3] == 1) ||
+                            (dim == 1 && op->ne[2]*op->ne[3] == 1));
+                }
+                return src0_type != GGML_TYPE_I16;
+            } break;
         case GGML_OP_DUP:
         case GGML_OP_REPEAT:
-        case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;

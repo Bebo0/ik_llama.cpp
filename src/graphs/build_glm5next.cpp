@@ -8,6 +8,33 @@
 // Mirrors OPENPANGU_IDX_SCORE_CHUNK.
 static constexpr int64_t GLM5NEXT_IDX_SCORE_CHUNK = 256;
 
+// Decode fast path for the DSA attention (n_tokens == 1, one sequence, F16 latent cache):
+// instead of flash attention over all n_kv cells behind an n_kv-wide sparse mask (built by
+// ggml_indexer_mask every layer), gather the r*n_sel selected cells + the tail into a
+// [kv_lora_rank, n_fast] K block and attend over that. The host-built mask bias keeps the
+// attended set identical to the masked path, including its one duplicate (cell 0, which the
+// tail's empty slots point at). Off below GLM5NEXT_DSA_FAST_MIN_KV cells (default 8192), where
+// the extra gathers cost about what flash attention over n_kv costs; GLM5NEXT_DSA_FAST=0 disables.
+struct glm5next_dsa_fast_inputs {
+    ggml_tensor * mbias  = nullptr;   // F32 [r, n_pool]
+    ggml_tensor * tail   = nullptr;   // I32 [n_fast - r*n_sel]
+    ggml_tensor * tbias  = nullptr;   // F32 [n_fast*mask_rows - r*n_sel]
+    int64_t       n_fast = 0;         // gathered K rows, a multiple of FATTN_KQ_STRIDE (256)
+    int64_t       n_rows = 0;         // mask rows, GGML_PAD(1, GGML_KQ_MASK_PAD)
+};
+
+static bool glm5next_dsa_fast_enabled(int64_t n_kv) {
+    static const int64_t min_kv = [] {
+        const char * off = getenv("GLM5NEXT_DSA_FAST");
+        if (off && atoi(off) == 0) {
+            return (int64_t) INT64_MAX;
+        }
+        const char * e = getenv("GLM5NEXT_DSA_FAST_MIN_KV");
+        return e ? (int64_t) atoll(e) : (int64_t) 8192;
+    }();
+    return n_kv >= min_kv;
+}
+
 // GLM-5.3-Flash (glm5next): hybrid trunk that alternates KDA linear attention (34 of 45
 // layers) with absorbed MLA + DSA lightning k-pool indexer (11 layers), every block wrapped
 // in hyper-connection streams (mHC, Sinkhorn). NoPE-only (rope.dimension_count = 0).
@@ -64,7 +91,12 @@ static ggml_tensor * build_glm5next_dsa_top_k(
         ggml_tensor * pool_cells,     // I32 [kpool*n_pool]   — cell index of each pool member
         ggml_tensor * pool_bias,      // F32 [n_pool, n_tokens] — 0 if pool visible, else -inf
         ggml_tensor * tail_cells,     // I32 [kpool-1, n_tokens, 1, 1] or null — trailing incomplete pool
-        ggml_tensor * ape_slots) {    // I32 [kpool]          — identity [0..kpool-1]
+        ggml_tensor * ape_slots,      // I32 [kpool]          — identity [0..kpool-1]
+        ggml_tensor * win_pools,      // I32 [n_win] or null  — pools this ubatch re-pools into kp_l
+        ggml_tensor * win_cells,      // I32 [kpool*n_win] or null — member cells of those pools
+        const glm5next_dsa_fast_inputs * fast,   // decode fast path inputs or null
+        ggml_tensor ** fast_idx,      // out: I32 [n_fast] cells to gather (fast path only)
+        ggml_tensor ** fast_mask) {   // out: F16 [n_fast, n_rows] mask over them (fast path only)
     auto & lctx    = llm.lctx;
     auto & ctx0    = llm.ctx0;
     auto & hparams = llm.hparams;
@@ -110,16 +142,26 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto all = ggml_view_2d(ctx0, kv_self.kr_l[il], 2 * d, n_kv, kr_row, 0);
     cb(all, "dsa_cached_all", il);
 
-    // ---- gather pool members: pool_cells indexes which cells belong to each pool ----
-    // pool_cells is 1D [r*n_pool]: membership depends on cache positions, shared across all query tokens
-    auto members = ggml_get_rows(ctx0, all, pool_cells);     // [2*d, r*n_pool]
-    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_pool);
+    // ---- pooled-key cache: re-pool only the pools this ubatch writes into ----
+    // A pool key is a function of its r member keys only, and a member key never changes once
+    // written, so a complete pool's key is fixed. With kv_self.kp_l present, only the n_win window
+    // pools (the pools holding this ubatch's positions, or every pool after a stale event) are
+    // pooled here and scattered into kp_l; all other pool keys are read back from kp_l. Without it
+    // (win_cells == null) every pool is re-pooled every step, O(n_kv) work per layer per token.
+    ggml_tensor * kp_cache = (win_cells && (size_t) il < kv_self.kp_l.size()) ? kv_self.kp_l[il] : nullptr;
+    ggml_tensor * gather   = kp_cache ? win_cells : pool_cells;
+    const int64_t n_pw     = kp_cache ? win_pools->ne[0] : n_pool;   // pools pooled in this graph
+
+    // ---- gather pool members: pool_cells / win_cells index which cells belong to each pool ----
+    // membership depends on cache positions, shared across all query tokens
+    auto members = ggml_get_rows(ctx0, all, gather);         // [2*d, r*n_pw]
+    members = ggml_reshape_3d(ctx0, members, 2 * d, r, n_pw);
     cb(members, "dsa_pool_members", il);
 
-    // split into keys [d, r, n_pool] and gates [d, r, n_pool] (packed along dim 0)
-    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    // split into keys [d, r, n_pw] and gates [d, r, n_pw] (packed along dim 0)
+    auto m_k = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pw,
             members->nb[1], members->nb[2], 0));
-    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pool,
+    auto m_g = ggml_cont(ctx0, ggml_view_3d(ctx0, members, d, r, n_pw,
             members->nb[1], members->nb[2], ggml_row_size(members->type, d)));
     cb(m_k, "dsa_pool_k", il);
     cb(m_g, "dsa_pool_g", il);
@@ -133,8 +175,18 @@ static ggml_tensor * build_glm5next_dsa_top_k(
     auto v = ggml_cont(ctx0, ggml_permute(ctx0, m_k, 1, 0, 2, 3));
     auto pooled = ggml_sum_rows(ctx0, ggml_mul(ctx0, v, w));
     pooled = ggml_cont(ctx0, ggml_permute(ctx0, pooled, 1, 0, 2, 3));
-    pooled = ggml_reshape_2d(ctx0, pooled, d, n_pool);
+    pooled = ggml_reshape_2d(ctx0, pooled, d, n_pw);
     cb(pooled, "dsa_indexer_k_pooled", il);
+
+    if (kp_cache) {
+        // scatter the window into the cache and score against the scatter's result (not the
+        // cache tensor itself), so the read below depends on the write. A short window repeats
+        // its last entry, which writes the same value twice.
+        auto kp_all = ggml_set_rows(ctx0, kp_cache, pooled, win_pools);
+        cb(kp_all, "dsa_kpool_scatter", il);
+        pooled = ggml_view_2d(ctx0, kp_all, d, n_pool, kp_all->nb[1], 0);
+        cb(pooled, "dsa_indexer_k_pooled_all", il);
+    }
 
     // ---- indexer query (nope-only: no rope) ----
     auto q = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);  // [d*nh, n_tok]
@@ -154,6 +206,10 @@ static ggml_tensor * build_glm5next_dsa_top_k(
             (int64_t) hparams.indexer_top_k / r,
             (n_kv - tail_cnt) / r});
     if (n_sel < 1) {
+        if (kp_cache) {
+            // the window's pool keys must still reach kp_l: this ubatch is their only chance
+            ggml_build_forward_expand(gf, pooled);
+        }
         return nullptr;  // cache too small for the indexer — dense attention over the few keys
     }
 
@@ -207,6 +263,23 @@ static ggml_tensor * build_glm5next_dsa_top_k(
             ggml_reshape_2d(ctx0, sel, n_sel * n_tok, 1));      // [r, n_sel*n_tok]
     top_k = ggml_reshape_2d(ctx0, top_k, r * n_sel, n_tok);     // [r*n_sel, n_tok]
 
+    if (fast) {
+        // the graph has no KQ_mask and no tail_cells in this mode, so there is no masked fallback
+        GGML_ASSERT(n_tok == 1 && r * n_sel + fast->tail->ne[0] == fast->n_fast);
+        // decode fast path: the gather list is the selected pools' cells, then the tail cells and
+        // pad rows (host input); the mask is the per-member bias of the selected pools, then the
+        // tail bias and -inf for the pad rows and the padded query rows (host input)
+        auto idx = ggml_concat(ctx0, ggml_reshape_1d(ctx0, top_k, r * n_sel), fast->tail, 0);   // I32 [n_fast]
+        cb(idx, "dsa_fast_idx", il);
+        auto mb  = ggml_get_rows(ctx0, fast->mbias, ggml_reshape_1d(ctx0, sel, n_sel));      // F32 [r, n_sel]
+        auto msk = ggml_concat(ctx0, ggml_reshape_1d(ctx0, mb, r * n_sel), fast->tbias, 0);   // F32 [n_fast*n_rows]
+        msk = ggml_reshape_2d(ctx0, ggml_cast(ctx0, msk, GGML_TYPE_F16), fast->n_fast, fast->n_rows);
+        cb(msk, "dsa_fast_mask", il);
+        *fast_idx  = idx;
+        *fast_mask = msk;
+        return nullptr;
+    }
+
     // index_kpool_always_select_tail: the trailing incomplete pool has no pool key and can
     // never be picked above, so its cells are appended instead of taking pool budget
     if (tail_cells) {
@@ -238,7 +311,10 @@ static ggml_tensor * build_glm5next_mla_attention(
         ggml_tensor * pool_cells    = nullptr,
         ggml_tensor * pool_bias     = nullptr,
         ggml_tensor * tail_cells    = nullptr,
-        ggml_tensor * ape_slots     = nullptr) {
+        ggml_tensor * ape_slots     = nullptr,
+        ggml_tensor * win_pools     = nullptr,
+        ggml_tensor * win_cells     = nullptr,
+        const glm5next_dsa_fast_inputs * fast = nullptr) {
     auto & lctx    = llm.lctx;
     auto & ctx0    = llm.ctx0;
     auto & hparams = llm.hparams;
@@ -264,9 +340,12 @@ static ggml_tensor * build_glm5next_mla_attention(
 
     // DSA k-pool indexer: score k-pools and pick top_k cells (null = dense fallback).
     // Gate: --dsa flag + indexer tensors present + kpool > 0 + pool metadata created.
-    ggml_tensor * top_k = nullptr;
+    ggml_tensor * top_k     = nullptr;
+    ggml_tensor * fast_idx  = nullptr;
+    ggml_tensor * fast_mask = nullptr;
     if (lctx.cparams.dsa && layer.indexer_attn_q_b && hparams.indexer_block_size > 0 && pool_cells) {
-        top_k = build_glm5next_dsa_top_k(llm, gf, il, cur, qr, pool_cells, pool_bias, tail_cells, ape_slots);
+        top_k = build_glm5next_dsa_top_k(llm, gf, il, cur, qr, pool_cells, pool_bias, tail_cells, ape_slots,
+                win_pools, win_cells, fast, &fast_idx, &fast_mask);
     }
 
     auto q = ggml_mul_mat(ctx0, layer.wq_b, qr);
@@ -309,8 +388,25 @@ static ggml_tensor * build_glm5next_mla_attention(
     // Flash is required for large contexts — the soft_max path materializes the full score
     // matrix [n_kv, n_tokens, n_head], whose compute buffer scales linearly with ctx-size.
     // Absorbed NoPE MLA: K = V = the compressed latent (kv_lora_rank, no rope part), MQA.
+    GGML_ASSERT(fast_idx || attn_mask);
     ggml_tensor * kqv_cmpr = nullptr;
-    if (lctx.cparams.flash_attn) {
+    if (fast_idx) {
+        // decode fast path: gather the selected latent rows (viewed as F32 words so get_rows copies
+        // them bit for bit; the row is kv_lora_rank F16 = 1024 bytes) and attend over those only.
+        // The cache_copies write above precedes this gather in the graph, so the query's own row
+        // (a tail cell) is already in place.
+        auto k_l      = kv_self.k_l[il];
+        auto k_row    = ggml_row_size(k_l->type, k_l->ne[0]);
+        auto k32      = ggml_reshape_4d_ext(ctx0, k_l, GGML_TYPE_F32, k_row / sizeof(float), k_l->ne[1], 1, 1);
+        k32           = ggml_get_rows(ctx0, k32, fast_idx);
+        auto K_sel    = ggml_reshape_4d_ext(ctx0, k32, k_l->type, k_l->ne[0], fast_idx->ne[0], 1, 1);
+        cb(K_sel, "dsa_fast_k", il);
+        kqv_cmpr = ggml_flash_attn_ext(ctx0, Qcur, K_sel, K_sel, fast_mask,
+                kq_scale, hparams.f_max_alibi_bias, 0.f);
+        cb(kqv_cmpr, "kqv_compressed", il);
+        kqv_cmpr = ggml_permute(ctx0, kqv_cmpr, 0, 2, 1, 3);
+        cb(kqv_cmpr, "kqv_compressed_perm", il);
+    } else if (lctx.cparams.flash_attn) {
         kqv_cmpr = ggml_flash_attn_ext(ctx0, Qcur, K_cache, K_cache, attn_mask,
                 kq_scale, hparams.f_max_alibi_bias, 0.f);
         if (K_cache->ne[1] < 256) {
@@ -513,7 +609,37 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     delta_net delta(lctx, batch);
 
     auto inpL = llm_build_inp_embd(ctx0, lctx, hparams, batch, model.tok_embd, cb);
-    auto KQ_mask = build_inp_KQ_mask();
+
+    const bool use_dsa = lctx.cparams.dsa
+        && hparams.indexer_head_size > 0
+        && hparams.indexer_block_size > 0
+        && !lctx.kv_self.kr_l.empty();
+
+    // decode fast path (see glm5next_dsa_fast_inputs): every MLA layer carries the indexer, so
+    // with it no layer reads the dense KQ_mask and the graph builds none (nor its O(n_kv) host fill)
+    glm5next_dsa_fast_inputs fast_in;
+    bool dsa_fast = false;
+    if (use_dsa && n_tokens == 1 && lctx.cparams.flash_attn && lctx.cparams.n_seq_max == 1 &&
+        lctx.kv_self.type_k == GGML_TYPE_F16 && glm5next_dsa_fast_enabled(n_kv)) {
+        const int64_t r     = hparams.indexer_block_size;
+        const int64_t n_sel = (int64_t) hparams.indexer_top_k / r;
+        // the pool cut must be the full budget in every layer: n_sel = min(n_pool, top_k/r, n_kv/r)
+        dsa_fast = r > 1 && n_sel > 0 && n_kv / r >= n_sel;
+        if (dsa_fast) {
+            fast_in.n_fast = GGML_PAD(r * n_sel + (r - 1), 256);   // FATTN_KQ_STRIDE
+            fast_in.n_rows = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
+        }
+    }
+    for (int il = 0; dsa_fast && il < (int) hparams.n_layer_kv_from_start; ++il) {
+        // an MLA layer without the indexer would attend densely through KQ_mask
+        if (!hparams.is_recurrent(il) &&
+            (!model.layers[il].indexer_attn_q_b || (size_t) il >= lctx.kv_self.kr_l.size() ||
+             !lctx.kv_self.kr_l[il])) {
+            dsa_fast = false;
+        }
+    }
+
+    auto KQ_mask = dsa_fast ? nullptr : build_inp_KQ_mask();
     auto inp_out_ids = build_inp_out_ids();
 
     // KDA recurrent state slot routing
@@ -527,10 +653,9 @@ ggml_cgraph * llm_build_context::build_glm5next() {
     ggml_tensor * pool_bias  = nullptr;
     ggml_tensor * tail_cells = nullptr;
     ggml_tensor * ape_slots  = nullptr;
-    const bool use_dsa = lctx.cparams.dsa
-        && hparams.indexer_head_size > 0
-        && hparams.indexer_block_size > 0
-        && !lctx.kv_self.kr_l.empty();
+    ggml_tensor * win_pools  = nullptr;
+    ggml_tensor * win_cells  = nullptr;
+    lctx.kpool_full_window_graph = false;
     if (use_dsa) {
         const int64_t r      = hparams.indexer_block_size;
         const int64_t n_kv   = this->n_kv;
@@ -545,17 +670,51 @@ ggml_cgraph * llm_build_context::build_glm5next() {
             lctx.inp_kpool_cells     = pool_cells;
             lctx.inp_kpool_bias      = pool_bias;
             lctx.inp_kpool_ape_slots = ape_slots;
-            if (r > 1) {
+            if (r > 1 && !dsa_fast) {
                 // trailing incomplete pool cells: [kpool-1, n_tokens] (per-query)
                 tail_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r - 1, n_tokens);
                 ggml_set_input(tail_cells);
                 lctx.inp_kpool_tail = tail_cells;
+            }
+            if (dsa_fast) {
+                // the fast path carries the tail in its own gather list instead
+                const int64_t n_sel = (int64_t) hparams.indexer_top_k / r;
+                fast_in.mbias = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, r, n_pool);
+                fast_in.tail  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, fast_in.n_fast - r * n_sel);
+                fast_in.tbias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, fast_in.n_fast * fast_in.n_rows - r * n_sel);
+                ggml_set_input(fast_in.mbias);
+                ggml_set_input(fast_in.tail);
+                ggml_set_input(fast_in.tbias);
+                lctx.inp_kpool_fast_mbias = fast_in.mbias;
+                lctx.inp_kpool_fast_tail  = fast_in.tail;
+                lctx.inp_kpool_fast_tbias = fast_in.tbias;
+                cb(fast_in.mbias, "inp_kpool_fast_mbias", -1);
+                cb(fast_in.tail,  "inp_kpool_fast_tail",  -1);
+                cb(fast_in.tbias, "inp_kpool_fast_tbias", -1);
             }
             cb(pool_cells, "inp_kpool_cells", -1);
             cb(pool_bias,  "inp_kpool_bias",  -1);
             cb(ape_slots,  "inp_kpool_ape",   -1);
             if (tail_cells) {
                 cb(tail_cells, "inp_kpool_tail", -1);
+            }
+            if (!lctx.kv_self.kp_l.empty()) {
+                // each token lands in exactly one pool, so n_tokens bounds the pools an ubatch
+                // touches whatever its positions; after a stale event every pool is rebuilt once,
+                // as it is when a pool written while out of range comes into range. A window
+                // covering every pool (n_win == n_pool) is filled with every pool on the host.
+                const bool    full      = lctx.qsa_pooled_stale || n_pool > lctx.kpool_skipped_min;
+                const int64_t n_win_min = std::min<int64_t>(n_pool, n_tokens);
+                const int64_t n_win     = full ? n_pool : n_win_min;
+                lctx.kpool_full_window_graph = n_win > n_win_min;
+                win_pools = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_win);
+                win_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, r * n_win);
+                ggml_set_input(win_pools);
+                ggml_set_input(win_cells);
+                lctx.inp_kpool_win_pools = win_pools;
+                lctx.inp_kpool_win_cells = win_cells;
+                cb(win_pools, "inp_kpool_win_pools", -1);
+                cb(win_cells, "inp_kpool_win_cells", -1);
             }
         }
     }
@@ -587,7 +746,8 @@ ggml_cgraph * llm_build_context::build_glm5next() {
             // NoPE absorbed MLA (applies attn_norm internally; no residual — mHC handles it).
             // When --dsa is active, the indexer builds a sparse top-k mask; else dense.
             cur = build_glm5next_mla_attention(*this, gf, il, cur, KQ_mask, kq_scale,
-                    pool_cells, pool_bias, tail_cells, ape_slots);
+                    pool_cells, pool_bias, tail_cells, ape_slots, win_pools, win_cells,
+                    dsa_fast ? &fast_in : nullptr);
         }
 
         inpL = build_mhc_post(cur, post_attn, residual_attn, comb_attn, n_embd, hc, true);
