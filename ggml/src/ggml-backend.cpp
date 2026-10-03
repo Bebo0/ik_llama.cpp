@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <array>
 #include <chrono>
 #include <barrier>
@@ -1163,6 +1164,9 @@ struct ggml_backend_sched_split {
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
+    // MoE weight staging (GGML_SCHED_MOE_STAGE): slot of this split's expert-weight copies, -1 = not staged
+    int  stage_slot;
+    bool stage_prefetched; // its weights were already uploaded during this compute
 };
 
 struct ggml_backend_sched {
@@ -1226,6 +1230,15 @@ struct ggml_backend_sched {
     bool is_async = false;
     bool debug;
     bool has_reduce = false;
+
+    // MoE weight staging (GGML_SCHED_MOE_STAGE=1), see ggml_backend_sched_stage_assign
+    bool moe_stage;
+    ggml_backend_buffer_t stage_buf [GGML_SCHED_MAX_BACKENDS][2];
+    size_t                stage_size[GGML_SCHED_MAX_BACKENDS][2];
+    ggml_backend_event_t  stage_free [GGML_SCHED_MAX_BACKENDS][2]; // compute stream: slot no longer read
+    ggml_backend_event_t  stage_ready[GGML_SCHED_MAX_BACKENDS][2]; // upload stream: slot filled
+    ggml_backend_t        stage_copy_backend[GGML_SCHED_MAX_BACKENDS]; // 2nd instance of the device = upload stream
+    bool                  stage_failed[GGML_SCHED_MAX_BACKENDS];
 };
 
 void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op op, bool on_or_off) {
@@ -1456,6 +1469,233 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+//
+// MoE weight staging (opt-in: GGML_SCHED_MOE_STAGE=1)
+//
+// A MoE matmul whose expert weights live in host memory is offloaded to a GPU for big batches
+// (ggml_backend_cuda_offload_op: batch*n_used >= 32*n_expert). copy_inputs then uploads the weights
+// into gallocr memory right before the split, on the compute stream, after reading the ids back to
+// the host: upload and GEMM of a layer are serialized, and the upload of the next layer cannot start
+// before its router has run. For batches this large every expert is active, so the ids buy nothing.
+//
+// With staging on, the expert-weight copies of such splits live in two persistent slots per GPU
+// (alternating over that GPU's staged splits: up/gate of layer L -> slot 0, down of layer L -> slot 1,
+// up/gate of layer L+1 -> slot 0, ...) instead of gallocr memory. Right after a staged split has been
+// enqueued, the full weights of the next staged split on that GPU are uploaded into the other slot on
+// a second stream (a second backend instance of the same device), ordered by two events per slot.
+// Uploads then overlap the GEMMs and whatever the other devices compute in between, and the host no
+// longer waits for the ids. GGML_SCHED_MOE_STAGE_ONE_STREAM=1 keeps the uploads on the compute stream.
+//
+static bool ggml_backend_sched_stageable_input(const struct ggml_tensor * input) {
+    return input->ne[2] > 1 && input->buffer != NULL &&
+           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+           ggml_backend_buffer_is_host(input->buffer);
+}
+
+static bool ggml_backend_sched_stage_init_backend(ggml_backend_sched_t sched, int b) {
+    if (sched->stage_failed[b]) {
+        return false;
+    }
+    if (sched->stage_free[b][0] != NULL) {
+        return true;
+    }
+    ggml_backend_t compute = sched->backends[b];
+    ggml_backend_t upload  = compute;
+    if (getenv("GGML_SCHED_MOE_STAGE_ONE_STREAM") == NULL) {
+        const size_t reg = ggml_backend_reg_find_by_name(ggml_backend_name(compute));
+        ggml_backend_t other = reg != SIZE_MAX ? ggml_backend_reg_init_backend(reg, NULL) : NULL;
+        if (other != NULL) {
+            sched->stage_copy_backend[b] = other;
+            upload = other;
+        } else {
+            fprintf(stderr, "%s: no second %s instance, uploading on the compute stream\n", __func__, ggml_backend_name(compute));
+        }
+    }
+    for (int s = 0; s < 2; ++s) {
+        sched->stage_free [b][s] = ggml_backend_event_new(compute);
+        sched->stage_ready[b][s] = ggml_backend_event_new(upload);
+        if (sched->stage_free[b][s] == NULL || sched->stage_ready[b][s] == NULL) {
+            fprintf(stderr, "%s: %s has no events, MoE staging off for it\n", __func__, ggml_backend_name(compute));
+            sched->stage_failed[b] = true;
+            return false;
+        }
+    }
+    return true;
+}
+
+// called at the end of split_graph: picks the staged splits and places their weight copies in the slots
+// (before gallocr runs, so gallocr treats them as external and leaves them out of the compute buffer)
+static void ggml_backend_sched_stage_assign(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    for (int i = 0; i < sched->n_splits; ++i) {
+        sched->splits[i].stage_slot = -1;
+        sched->splits[i].stage_prefetched = false;
+    }
+    if (!sched->moe_stage || sched->n_copies > 1 || sched->split_mode_graph) {
+        return;
+    }
+
+    // candidates: GPU splits that start with an offloaded MoE matmul and have expert weights to upload
+    std::vector<int> cand;
+    std::unordered_map<const struct ggml_tensor *, int> owner; // weight copy -> candidate split
+    for (int i = 0; i < sched->n_splits; ++i) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        const int b = split->backend_id;
+        if (b < 0 || b >= sched->n_backends - 1 || ggml_backend_is_cpu(sched->backends[b]) || sched->stage_failed[b]) {
+            continue;
+        }
+        if (split->i_start >= split->i_end) {
+            continue;
+        }
+        const struct ggml_tensor * node = graph->nodes[split->i_start];
+        if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_MOE_FUSED_UP_GATE) {
+            continue;
+        }
+        bool any = false;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (ggml_backend_sched_stageable_input(split->inputs[j])) {
+                owner[tensor_copy(split->inputs[j], b, 0)] = i;
+                any = true;
+            }
+        }
+        if (any) {
+            cand.push_back(i);
+        }
+    }
+    if (cand.empty()) {
+        return;
+    }
+
+    // a slot is overwritten one staged split later, so a copy must not be read outside its own split
+    std::vector<bool> bad(sched->n_splits, false);
+    for (int n = 0; n < graph->n_nodes; ++n) {
+        const struct ggml_tensor * node = graph->nodes[n];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const struct ggml_tensor * src = node->src[j];
+            if (src == NULL) {
+                continue;
+            }
+            auto it = owner.find(src->view_src ? src->view_src : src);
+            if (it != owner.end() && (n < sched->splits[it->second].i_start || n >= sched->splits[it->second].i_end)) {
+                bad[it->second] = true;
+            }
+        }
+    }
+
+    // alternate the slots over each backend's staged splits and size them
+    int    counter[GGML_SCHED_MAX_BACKENDS] = {0};
+    size_t need[GGML_SCHED_MAX_BACKENDS][2] = {};
+    for (int i : cand) {
+        if (bad[i]) {
+            continue;
+        }
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        const int b = split->backend_id;
+        const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
+        size_t size = 0;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (ggml_backend_sched_stageable_input(split->inputs[j])) {
+                size += GGML_PAD(ggml_backend_buft_get_alloc_size(sched->bufts[b], tensor_copy(split->inputs[j], b, 0)), align);
+            }
+        }
+        split->stage_slot = counter[b]++ & 1;
+        need[b][split->stage_slot] = std::max(need[b][split->stage_slot], size);
+    }
+
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (counter[b] == 0) {
+            continue;
+        }
+        bool ok = ggml_backend_sched_stage_init_backend(sched, b);
+        for (int s = 0; ok && s < 2; ++s) {
+            if (need[b][s] <= sched->stage_size[b][s]) {
+                continue;
+            }
+            // the slot may still be read or written by the previous graph
+            ggml_backend_synchronize(sched->backends[b]);
+            if (sched->stage_copy_backend[b]) {
+                ggml_backend_synchronize(sched->stage_copy_backend[b]);
+            }
+            if (sched->stage_buf[b][s]) {
+                ggml_backend_buffer_free(sched->stage_buf[b][s]);
+                sched->stage_buf[b][s]  = NULL;
+                sched->stage_size[b][s] = 0;
+            }
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(sched->bufts[b], need[b][s]);
+            if (buf == NULL) {
+                fprintf(stderr, "%s: cannot allocate a %.1f MiB MoE staging slot on %s, staging off for it\n",
+                        __func__, need[b][s]/1048576.0, ggml_backend_name(sched->backends[b]));
+                sched->stage_failed[b] = true;
+                ok = false;
+                break;
+            }
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            ggml_backend_buffer_clear(buf, 0);
+            sched->stage_buf[b][s]  = buf;
+            sched->stage_size[b][s] = need[b][s];
+            fprintf(stderr, "%s: %s MoE staging slot %d = %.1f MiB (%s uploads)\n", __func__, ggml_backend_name(sched->backends[b]),
+                    s, need[b][s]/1048576.0, sched->stage_copy_backend[b] ? "overlapped" : "compute-stream");
+        }
+        if (!ok) {
+            // fall back to the gallocr path for this backend and give the memory back to it
+            for (int s = 0; s < 2; ++s) {
+                if (sched->stage_buf[b][s]) {
+                    ggml_backend_buffer_free(sched->stage_buf[b][s]);
+                    sched->stage_buf[b][s]  = NULL;
+                    sched->stage_size[b][s] = 0;
+                }
+            }
+            for (int i : cand) {
+                if (sched->splits[i].backend_id == b) {
+                    sched->splits[i].stage_slot = -1;
+                }
+            }
+        }
+    }
+
+    // place the copies
+    for (int i : cand) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        if (split->stage_slot < 0) {
+            continue;
+        }
+        const int b = split->backend_id;
+        ggml_backend_buffer_t buf = sched->stage_buf[b][split->stage_slot];
+        const size_t align = ggml_backend_buft_get_alignment(sched->bufts[b]);
+        char * base = (char *) ggml_backend_buffer_get_base(buf);
+        size_t offset = 0;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (!ggml_backend_sched_stageable_input(split->inputs[j])) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], b, 0);
+            GGML_ASSERT(input_cpy->data == NULL && input_cpy->buffer == NULL);
+            ggml_backend_tensor_alloc(buf, input_cpy, base + offset);
+            offset += GGML_PAD(ggml_backend_buft_get_alloc_size(sched->bufts[b], input_cpy), align);
+        }
+    }
+}
+
+// uploads the full expert weights of a staged split into its slot (no ids needed)
+static void ggml_backend_sched_stage_upload(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split) {
+    const int b = split->backend_id;
+    const int s = split->stage_slot;
+    ggml_backend_t upload = sched->stage_copy_backend[b] ? sched->stage_copy_backend[b] : sched->backends[b];
+    if (upload != sched->backends[b]) {
+        // do not overwrite the slot before the compute stream is done with its previous tenant
+        ggml_backend_event_wait(upload, sched->stage_free[b][s]);
+    }
+    for (int j = 0; j < split->n_inputs; ++j) {
+        struct ggml_tensor * input = split->inputs[j];
+        if (!ggml_backend_sched_stageable_input(input)) {
+            continue;
+        }
+        ggml_moe_prefetch_wait(input);
+        ggml_backend_tensor_set_async(upload, tensor_copy(input, b, sched->cur_copy), input->data, 0, ggml_nbytes(input));
+    }
+    ggml_backend_event_record(sched->stage_ready[b][s]);
+    split->stage_prefetched = true;
 }
 
 static inline uint64_t get_next_graph_uid() {
@@ -1904,6 +2144,8 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
         sched->n_splits = i_split + 1;
     }
 
+    ggml_backend_sched_stage_assign(sched, graph);
+
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
     }
@@ -2048,6 +2290,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+        if (sched->moe_stage && split->stage_slot >= 0 && ggml_backend_sched_stageable_input(input)) {
+            // uploaded into its staging slot by ggml_backend_sched_stage_upload
+            continue;
+        }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2503,6 +2750,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    if (sched->moe_stage) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            splits[i].stage_prefetched = false;
+        }
+        // start each backend's first staged upload now, so it overlaps the graph's leading non-MoE layers
+        bool started[GGML_SCHED_MAX_BACKENDS] = {false};
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (splits[i].stage_slot >= 0 && !started[splits[i].backend_id]) {
+                started[splits[i].backend_id] = true;
+                ggml_backend_sched_stage_upload(sched, &splits[i]);
+            }
+        }
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2510,6 +2771,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const bool staged = sched->moe_stage && split->stage_slot >= 0;
+        if (staged && !split->stage_prefetched) {
+            // not uploaded ahead (should not happen: the previous staged split of this backend does it)
+            ggml_backend_sched_stage_upload(sched, split);
+        }
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2548,9 +2815,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
+        if (staged) {
+            // the kernels of this split read the slot only after its upload has landed
+            ggml_backend_event_wait(split_backend, sched->stage_ready[split_backend_id][split->stage_slot]);
+        }
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
+        }
+        if (staged) {
+            ggml_backend_event_record(sched->stage_free[split_backend_id][split->stage_slot]);
+            // upload the next staged split of this backend into the other slot while this one computes
+            for (int k = i + 1; k < sched->n_splits; ++k) {
+                struct ggml_backend_sched_split * next = &splits[k];
+                if (next->backend_id != split_backend_id || next->stage_slot < 0) {
+                    continue;
+                }
+                if (!next->stage_prefetched && next->stage_slot != split->stage_slot) {
+                    ggml_backend_sched_stage_upload(sched, next);
+                }
+                break;
+            }
         }
 
         // the pages the lookahead streamer just read for this split are one-shot
@@ -2591,6 +2876,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->debug = getenv("GGML_SCHED_DEBUG") != NULL;
     sched->n_backends = n_backends;
+    {
+        const char * env = getenv("GGML_SCHED_MOE_STAGE");
+        sched->moe_stage = env != NULL && atoi(env) != 0;
+    }
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
     // initialize hash table
@@ -2646,6 +2935,21 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; ++i) {
         if (sched->input_memory_bufs[i]) {
             ggml_backend_buffer_free(sched->input_memory_bufs[i]);
+        }
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (sched->stage_copy_backend[b]) {
+            ggml_backend_synchronize(sched->stage_copy_backend[b]);
+        }
+        for (int s = 0; s < 2; ++s) {
+            ggml_backend_event_free(sched->stage_free[b][s]);
+            ggml_backend_event_free(sched->stage_ready[b][s]);
+            if (sched->stage_buf[b][s]) {
+                ggml_backend_buffer_free(sched->stage_buf[b][s]);
+            }
+        }
+        if (sched->stage_copy_backend[b]) {
+            ggml_backend_free(sched->stage_copy_backend[b]);
         }
     }
     ggml_gallocr_free(sched->galloc);
@@ -2814,6 +3118,9 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+        if (sched->stage_copy_backend[i]) {
+            ggml_backend_synchronize(sched->stage_copy_backend[i]);
+        }
     }
 }
 
